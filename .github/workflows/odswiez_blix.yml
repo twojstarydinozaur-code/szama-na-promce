@@ -1,0 +1,45 @@
+
+name: Odswiez gazetki Blix i opublikuj Szama na Promce
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '25 6 * * *'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Zainstaluj zaleznosci
+        run: pip install -r requirements.txt
+      - name: Testy importu
+        run: python -m unittest discover -s tests -p test_blix_import.py -v
+      - name: Pobierz oferty z Blix
+        run: |
+          python scripts/blix_import.py --output site/data/blix_promocje.json --max-per-store 2 || echo 'Nie udalo sie pobrac ofert.'
+      - name: Konfiguruj GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Spakuj strone
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: Opublikuj strone
+        id: deploy
+        uses: actions/deploy-pages@v4
