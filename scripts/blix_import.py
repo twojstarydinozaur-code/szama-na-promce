@@ -110,8 +110,36 @@ def date_range(raw, now):
     return (a.isoformat(),b.isoformat()) if b>=a and (b-a).days<=70 else None
 
 
-def parse_rss(xml_text, now, max_per_store=2):
-    root=ET.fromstring(xml_text)
+def parse_rss_document(xml_text):
+    """Read a complete RSS document. Accept *only* a valid RSS followed by junk.
+
+    Blix occasionally sends extra data after its closing </rss> tag. Strict XML
+    parsing rejects this as 'junk after document element'. We may safely ignore
+    ONLY the surplus trailing bytes if the leading RSS document itself parses
+    without errors. Broken entries inside RSS are not silently repaired.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+        recovered = False
+    except ET.ParseError as exc:
+        if 'junk after document element' not in str(exc):
+            raise
+        open_tag = re.search(r'<rss(?=[\s>])', xml_text, re.I)
+        close_tag = re.search(r'</rss\s*>', xml_text, re.I)
+        if open_tag is None or close_tag is None or close_tag.start() <= open_tag.start():
+            raise
+        # Parse strictly again: any broken XML *inside* the RSS still fails.
+        root = ET.fromstring(xml_text[:close_tag.end()])
+        recovered = True
+    if root.tag != 'rss':
+        raise ValueError('Nieoczekiwany główny element XML: '+str(root.tag))
+    return root, recovered
+
+
+def parse_rss(xml_text, now, max_per_store=2, warnings=None):
+    root, recovered = parse_rss_document(xml_text)
+    if recovered and warnings is not None:
+        warnings.append('RSS zawierał dodatkowe dane po </rss>; użyto tylko poprawnego dokumentu RSS.')
     found={key:[] for key in STORES}
     for item in root.findall('.//item'):
         url=(item.findtext('link') or '').strip()
@@ -238,11 +266,11 @@ class Fetcher:
 
 def run(output_path,now=None,fetcher=None,max_per_store=2):
     now=now or dt.date.today();fetcher=fetcher or Fetcher()
-    result={'source':'https://blix.pl/rss/gazetki','generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'validFor':now.isoformat(),'status':'ok','leaflets':[],'offers':[],'review':[],'errors':[],'notice':'Automatyczny odczyt strony źródłowej, nie potwierdzenie ceny w sklepie. Braki danych wymagają sprawdzenia.'}
+    result={'source':'https://blix.pl/rss/gazetki','generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'validFor':now.isoformat(),'status':'ok','leaflets':[],'offers':[],'review':[],'errors':[],'warnings':[],'notice':'Automatyczny odczyt strony źródłowej, nie potwierdzenie ceny w sklepie. Braki danych wymagają sprawdzenia.'}
     try: rss=fetcher.get(RSS_URL)
     except Exception as e:
         result['status']='source_unavailable';result['errors'].append(str(e));return write(output_path,result)
-    try: leaflets=parse_rss(rss,now,max_per_store=max_per_store)
+    try: leaflets=parse_rss(rss,now,max_per_store=max_per_store,warnings=result['warnings'])
     except Exception as e:
         result['status']='invalid_feed';result['errors'].append(str(e));return write(output_path,result)
     result['leaflets']=leaflets
@@ -254,7 +282,9 @@ def run(output_path,now=None,fetcher=None,max_per_store=2):
         except Exception as e:
             result['errors'].append(item['store']+': '+str(e))
             if 'HTTP 429' in str(e) or 'HTTP 403' in str(e):break
-    if result['errors'] and result['status']=='ok':result['status']='partial'
+    if (result['errors'] or result['warnings']) and result['status']=='ok':result['status']='partial'
+    if not result['leaflets'] and result['status'] in ('ok','partial'):
+        result['warnings'].append('Nie znaleziono gazetek tych sześciu sklepów z jednoznaczną aktualną datą w tytule RSS.')
     # prevent excessive stored candidate data
     result['offers']=result['offers'][:350];result['review']=result['review'][:500]
     return write(output_path,result)
