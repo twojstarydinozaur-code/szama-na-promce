@@ -244,6 +244,49 @@ def embedded_size(row):
     return ''
 
 
+# Blix may expose the unit for the displayed PRICE separately from product pack size.
+# Convert it to a standardized purchase quantity only when explicit.
+PRICE_UNIT_FIELDS = ('priceUnit', 'unitPriceUnit', 'pricePerUnit',
+                     'pricePer', 'pricingUnit', 'priceUnitLabel')
+
+def price_unit_size(row):
+    """Return normalized 1kg/1l/1piece ONLY from explicit price-denominator fields.
+
+    Never assume that unlabelled 10.99 means per kilogram, even for meat.
+    """
+    product=row.get('product') if isinstance(row.get('product'),dict) else {}
+    for data in (row,product):
+        for key in PRICE_UNIT_FIELDS:
+            val=data.get(key)
+            if isinstance(val,dict):
+                val=val.get('unit',val.get('label',val.get('name')))
+            if not isinstance(val,str):continue
+            t=normalize(val).replace(' ', '')
+            t=t.replace('zł/','').replace('pln/','').lstrip('/')
+            if t in ('kg','1kg','1000g'):
+                return '1 kg'
+            if t in ('l','1l','1000ml'):
+                return '1 l'
+            if t in ('szt','szt.','sztuka','1szt','1szt.'):
+                return '1 szt'
+    return ''
+
+def schema_debug_sample(rows, max_items=6):
+    """Bounded diagnostic of public product fields; prices and names remain in review.
+
+    Do not dump full page HTML, cookies or arbitrary values to the public site.
+    """
+    out=[]
+    for row in rows:
+        name=embedded_name(row)
+        if not ingredient_match(name):continue
+        keys=sorted(str(k) for k in row.keys())[:30]
+        product=row.get('product') if isinstance(row.get('product'),dict) else {}
+        example={'name':name[:90],'keys':keys,'productKeys':sorted(str(k) for k in product.keys())[:25]}
+        if example not in out:out.append(example)
+        if len(out)>=max_items:break
+    return out
+
 def window_offer_candidates(html,leaflet):
     rows=embedded_offers(html)
     candidates=[]
@@ -260,7 +303,7 @@ def window_offer_candidates(html,leaflet):
                 if isinstance(nested,dict) and key in nested:
                     price=embedded_price(nested[key]);break
         if price is None:continue
-        size=embedded_size(row)
+        size=embedded_size(row) or price_unit_size(row)
         label=(name+' '+size).strip() if size and size.lower() not in name.lower() else name
         detail=''
         for key in ('promotionText','promoText','conditions','promoLabel'):
@@ -286,6 +329,13 @@ def extract_candidates(html, leaflet, today, diagnostics=None):
     if diagnostics is not None:
         diagnostics['embeddedObjects']+=catalog_count
         diagnostics['catalogCandidates']+=len(candidates)
+        diag_rows=embedded_offers(html)
+        diagnostics['explicitPriceUnits']=diagnostics.get('explicitPriceUnits',0)+sum(bool(price_unit_size(r)) for r in diag_rows)
+        diagnostics['explicitPackSizes']=diagnostics.get('explicitPackSizes',0)+sum(bool(embedded_size(r)) for r in diag_rows)
+        samples=schema_debug_sample(diag_rows,4)
+        for sample in samples:
+            if len(diagnostics.setdefault('sampleProductKeys',[]))<12:
+                diagnostics['sampleProductKeys'].append(sample)
     # JSON-LD structured Product/Offer; no JS execution, no bypass.
     def traverse(obj):
         if isinstance(obj,list):
@@ -384,7 +434,7 @@ class Fetcher:
 
 def run(output_path,now=None,fetcher=None,max_per_store=2):
     now=now or dt.date.today();fetcher=fetcher or Fetcher()
-    result={'source':'https://blix.pl/rss/gazetki','generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'validFor':now.isoformat(),'status':'ok','leaflets':[],'offers':[],'review':[],'errors':[],'warnings':[],'diagnostics':{'pagesFetched':0,'embeddedObjects':0,'catalogCandidates':0,'accepted':0,'review':0},'notice':'Automatyczny odczyt strony źródłowej, nie potwierdzenie ceny w sklepie. Braki danych wymagają sprawdzenia.'}
+    result={'source':'https://blix.pl/rss/gazetki','generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'validFor':now.isoformat(),'status':'ok','leaflets':[],'offers':[],'review':[],'errors':[],'warnings':[],'diagnostics':{'pagesFetched':0,'embeddedObjects':0,'catalogCandidates':0,'explicitPriceUnits':0,'explicitPackSizes':0,'sampleProductKeys':[],'accepted':0,'review':0},'notice':'Automatyczny odczyt strony źródłowej, nie potwierdzenie ceny w sklepie. Braki danych wymagają sprawdzenia.'}
     try: rss=fetcher.get(RSS_URL)
     except Exception as e:
         result['status']='source_unavailable';result['errors'].append(str(e));return write(output_path,result)
