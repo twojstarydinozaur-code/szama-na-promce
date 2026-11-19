@@ -147,6 +147,8 @@ def parse_rss(xml_text, now, max_per_store=2, warnings=None):
         m=re.fullmatch(r'https://blix\.pl/sklep/([^/]+)/gazetka/\d+/?',url)
         if not m or m.group(1) not in STORES:continue
         slug=m.group(1)
+        # Avoid local-only flyers for other cities (as seen in current RSS).
+        if re.search(r'wielkie otwarcie|pabianice|zielona g[oó]ra|racib[oó]rz', title, re.I):continue
         if len(found[slug])>=max_per_store:continue
         dates=date_range(title,now)
         if not dates or dates[0]>now.isoformat() or dates[1]<now.isoformat():continue
@@ -170,9 +172,120 @@ def parse_size(text, ingredient):
     return converted[0] if len(set(converted))==1 and converted else None
 
 
-def extract_candidates(html, leaflet, today):
-    soup=BeautifulSoup(html,'html.parser')
+# Blix leaflet pages can embed a product catalog as window.offers = [...] .
+# Decode only JSON literals: never run JavaScript and never guess a price.
+WINDOW_OFFERS = re.compile(r'(?:window\s*\.\s*offers|window\s*\[\s*[\"\']offers[\"\']\s*\])\s*=\s*', re.I)
+
+def embedded_offers(html):
+    """Read valid JSON array/object assigned to window.offers, if exposed publicly."""
+    decoder=json.JSONDecoder()
+    records=[]
+    for m in list(WINDOW_OFFERS.finditer(html))[:5]:
+        piece=html[m.end():].lstrip()
+        try:
+            if piece.startswith('JSON.parse('):
+                arg=piece[len('JSON.parse('):].lstrip()
+                json_string,_=decoder.raw_decode(arg)
+                if not isinstance(json_string,str):continue
+                data=json.loads(json_string)
+            else:
+                data,_=decoder.raw_decode(piece)
+        except (json.JSONDecodeError,ValueError,TypeError):
+            continue
+        if isinstance(data,dict):
+            data=data.get('offers',data.get('products',data.get('items',[])))
+        if isinstance(data,list):
+            records += [x for x in data if isinstance(x,dict)]
+    return records
+
+
+def embedded_name(row):
+    p=row.get('product')
+    nested=p if isinstance(p,dict) else {}
+    for candidate in (row.get('name'),row.get('productName'),row.get('title'),
+                      nested.get('name'), nested.get('productName'), nested.get('title')):
+        if isinstance(candidate,str) and candidate.strip():return candidate.strip()
+    return ''
+
+
+def embedded_price(value):
+    """Return price in PLN or None. Integer fields in Blix window.offers are grosze."""
+    if isinstance(value,dict):
+        for key in ('amount','value','gross','price'):
+            if key in value:return embedded_price(value[key])
+        return None
+    if isinstance(value,bool) or value is None:return None
+    if isinstance(value,int):
+        amount=value/100
+    elif isinstance(value,float):
+        amount=value
+    elif isinstance(value,str):
+        txt=value.strip().replace('\xa0','').replace('zł','').strip().replace(',','.')
+        if not re.fullmatch(r'\d+(?:\.\d{1,2})?',txt):return None
+        amount=int(txt)/100 if '.' not in txt else float(txt)
+    else:
+        return None
+    if not (0.10<=amount<=1000):return None
+    return round(amount,2)
+
+
+def embedded_size(row):
+    """Textual pack information only; a bare number without units is not trusted."""
+    product=row.get('product') if isinstance(row.get('product'),dict) else {}
+    for d in (row,product):
+        for key in ('packageSize','packSize','weight','quantity','size','unitSize','netWeight'):
+            v=d.get(key)
+            if isinstance(v,str) and WEIGHT.search(v):return v
+            if isinstance(v,dict):
+                value=v.get('value',v.get('amount'))
+                unit=v.get('unit',v.get('unitOfMeasure'))
+                if isinstance(value,(int,float)) and isinstance(unit,str) and unit.lower() in ('kg','g','l','ml','szt','szt.'):
+                    return str(value)+' '+unit
+    return ''
+
+
+def window_offer_candidates(html,leaflet):
+    rows=embedded_offers(html)
     candidates=[]
+    for row in rows:
+        name=embedded_name(row)
+        if not name:continue
+        price=None
+        for key in ('promotionalPrice','promoPrice','currentPrice','price','grossPrice'):
+            if key in row:
+                price=embedded_price(row[key]);break
+        if price is None:
+            for key in ('price','promotionalPrice'):
+                nested=row.get('product')
+                if isinstance(nested,dict) and key in nested:
+                    price=embedded_price(nested[key]);break
+        if price is None:continue
+        size=embedded_size(row)
+        label=(name+' '+size).strip() if size and size.lower() not in name.lower() else name
+        detail=''
+        for key in ('promotionText','promoText','conditions','promoLabel'):
+            value=row.get(key)
+            if isinstance(value,str):detail+=' '+value[:200]
+        line=f'{label} za {str(format(price,".2f")).replace(".",",")} zł{detail}'
+        url=row.get('url') or row.get('link') or leaflet['url']
+        if not isinstance(url,str) or not url.startswith('https://blix.pl/'):
+            url=leaflet['url']
+        regular=None
+        for key in ('regularPrice','originalPrice','oldPrice','previousPrice'):
+            if key in row:
+                regular=embedded_price(row[key])
+                break
+        extras={'regularPrice':regular if regular is not None and regular>price else None}
+        candidates.append((label,line,url,'window.offers',extras))
+    return candidates,len(rows)
+
+
+def extract_candidates(html, leaflet, today, diagnostics=None):
+    soup=BeautifulSoup(html,'html.parser')
+    candidates, catalog_count=window_offer_candidates(html,leaflet)
+    if diagnostics is not None:
+        diagnostics['embeddedObjects']+=catalog_count
+        diagnostics['catalogCandidates']+=len(candidates)
     # JSON-LD structured Product/Offer; no JS execution, no bypass.
     def traverse(obj):
         if isinstance(obj,list):
@@ -208,7 +321,9 @@ def extract_candidates(html, leaflet, today):
             for item in m.group(1).split(', '):
                 if PRICE.search(item):candidates.append((item,item,leaflet['url'],'description'))
     unique=set(); accepted=[]; review=[]
-    for name,txt,url,method in candidates:
+    for candidate in candidates:
+        name,txt,url,method=candidate[:4]
+        extras=candidate[4] if len(candidate)>4 else {}
         if REJECTED_CATEGORIES.search(name):continue
         ing=ingredient_match(name)
         if ing is None or ing=='pierś z kurczaka':continue
@@ -220,7 +335,7 @@ def extract_candidates(html, leaflet, today):
         size=parse_size(name,ing)
         note='Źródło: Blix, '+method
         if PROMO_COMPLEX.search(txt+' '+name):note+='; sprawdź warunki promocji'
-        base={'ingredient':ing,'store':leaflet['store'],'product':name[:220],'price':round(price,2),'regularPrice':None,'from':leaflet['from'],'to':leaflet['to'],'url':url if url.startswith('https://blix.pl/') else leaflet['url'],'note':note,'minQty':1,'source':'Blix','sourceMethod':method}
+        base={'ingredient':ing,'store':leaflet['store'],'product':name[:220],'price':round(price,2),'regularPrice':extras.get('regularPrice'),'from':leaflet['from'],'to':leaflet['to'],'url':url if url.startswith('https://blix.pl/') else leaflet['url'],'note':note,'minQty':1,'source':'Blix','sourceMethod':method}
         key=(ing,base['store'],base['price'],name)
         if key in unique:continue
         unique.add(key)
@@ -231,6 +346,9 @@ def extract_candidates(html, leaflet, today):
         else:
             base.update({'problem':'brak jednoznacznej gramatury/jednostki lub warunki wielosztukowe','pack':None,'unit':None})
             review.append(base)
+    if diagnostics is not None:
+        diagnostics['accepted']+=len(accepted)
+        diagnostics['review']+=len(review)
     return accepted,review
 
 
@@ -266,7 +384,7 @@ class Fetcher:
 
 def run(output_path,now=None,fetcher=None,max_per_store=2):
     now=now or dt.date.today();fetcher=fetcher or Fetcher()
-    result={'source':'https://blix.pl/rss/gazetki','generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'validFor':now.isoformat(),'status':'ok','leaflets':[],'offers':[],'review':[],'errors':[],'warnings':[],'notice':'Automatyczny odczyt strony źródłowej, nie potwierdzenie ceny w sklepie. Braki danych wymagają sprawdzenia.'}
+    result={'source':'https://blix.pl/rss/gazetki','generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'validFor':now.isoformat(),'status':'ok','leaflets':[],'offers':[],'review':[],'errors':[],'warnings':[],'diagnostics':{'pagesFetched':0,'embeddedObjects':0,'catalogCandidates':0,'accepted':0,'review':0},'notice':'Automatyczny odczyt strony źródłowej, nie potwierdzenie ceny w sklepie. Braki danych wymagają sprawdzenia.'}
     try: rss=fetcher.get(RSS_URL)
     except Exception as e:
         result['status']='source_unavailable';result['errors'].append(str(e));return write(output_path,result)
@@ -277,7 +395,8 @@ def run(output_path,now=None,fetcher=None,max_per_store=2):
     for item in leaflets:
         try:
             html=fetcher.get(item['url'])
-            yes,no=extract_candidates(html,item,now)
+            result['diagnostics']['pagesFetched']+=1
+            yes,no=extract_candidates(html,item,now,diagnostics=result['diagnostics'])
             result['offers']+=yes;result['review']+=no
         except Exception as e:
             result['errors'].append(item['store']+': '+str(e))
@@ -285,6 +404,9 @@ def run(output_path,now=None,fetcher=None,max_per_store=2):
     if (result['errors'] or result['warnings']) and result['status']=='ok':result['status']='partial'
     if not result['leaflets'] and result['status'] in ('ok','partial'):
         result['warnings'].append('Nie znaleziono gazetek tych sześciu sklepów z jednoznaczną aktualną datą w tytule RSS.')
+    if result['leaflets'] and not result['offers'] and not result['review']:
+        result['warnings'].append('Wykryto gazetki, ale nie udało się odczytać ani jednej ceny składnika. Sprawdź diagnostics oraz strukturę stron Blixa.')
+        if result['status']=='ok':result['status']='partial'
     # prevent excessive stored candidate data
     result['offers']=result['offers'][:350];result['review']=result['review'][:500]
     return write(output_path,result)
