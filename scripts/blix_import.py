@@ -7,6 +7,7 @@ Missing unit/pack/promo details -> review candidate, not a price in the recipe r
 """
 from __future__ import annotations
 import argparse
+import os
 import datetime as dt
 import hashlib
 import json
@@ -287,38 +288,131 @@ def schema_debug_sample(rows, max_items=6):
         if len(out)>=max_items:break
     return out
 
+# Variant field names observed in retail feeds; never interpret unrelated generic
+# "unit" or a percentage as a package size unless paired with a quantity.
+REGULAR_KEYS = ('regularPrice','originalPrice','oldPrice','previousPrice',
+                'priceBeforeDiscount','priceBefore','priceOld','old_price',
+                'referencePrice','basePrice','crossedOutPrice','strikePrice')
+DISCOUNT_KEYS = ('discountPct','discountPercent','discountPercentage',
+                 'discountRate','discount','percentOff','percentageOff',
+                 'discount_percent','savingPercent')
+PRICE_KEYS = ('promotionalPrice','promoPrice','currentPrice','price','grossPrice',
+              'finalPrice','salePrice','promo_price')
+
+
+def _contexts(row):
+    yield row
+    for k in ('product','offer','pricing','priceDetails','priceInfo','promotion','details'):
+        x=row.get(k)
+        if isinstance(x,dict):yield x
+
+
+def _lookup(row,keys):
+    for d in _contexts(row):
+        for k in keys:
+            if k in d and d[k] is not None:return d[k],k
+    return None,''
+
+
+def discount_pct(v):
+    if isinstance(v,dict):
+        for k in ('percent','percentage','value','amount'):
+            if k in v:return discount_pct(v[k])
+        return None
+    if isinstance(v,bool) or v is None:return None
+    if isinstance(v,str):
+        t=v.strip().replace('−','-').replace(',','.').replace(' ','')
+        m=re.fullmatch(r'-?(\d{1,3}(?:\.\d+)?)%?',t)
+        if not m:return None
+        pct=float(m.group(1))
+    elif isinstance(v,(int,float)):
+        pct=abs(float(v))
+    else:return None
+    # Some backends encode discountRate as a fraction rather than a percentage.
+    if 0<pct<1:pct*=100
+    return round(pct,2) if 0<pct<100 else None
+
+
+def _read_discount(row):
+    v,key=_lookup(row,DISCOUNT_KEYS)
+    pct=discount_pct(v)
+    if pct is None:
+        for d in _contexts(row):
+            for k in ('promotionText','promoText','discountLabel','promoLabel','label'):
+                txt=d.get(k)
+                if isinstance(txt,str):
+                    m=re.search(r'[-−]\s*(\d{1,2})\s*%',txt)
+                    if m:return float(m.group(1)),'text:'+k
+    return pct,key if pct is not None else ''
+
+
+def _read_size(row):
+    # Try explicit pack / pricing denominators only. The row's generic `unit`
+    # on its own could mean a category, brand, or product quantity.
+    for d in _contexts(row):
+        sz=price_unit_size(d) or embedded_size(d)
+        if sz:return sz
+        for price_field in PRICE_UNIT_FIELDS:
+            raw=d.get(price_field)
+            if isinstance(raw,str):
+                match=re.search(r'(?<!\w)(\d+(?:[,.]\d+)?)\s*(kg|g|l|ml|szt\.?)(?!\w)',raw,re.I)
+                if match:return match.group(0)
+        for key in ('unitPriceText','priceDescription','quantityLabel',
+                    'packaging','measure','measurement','subtitle','description'):
+            value=d.get(key)
+            if isinstance(value,str):
+                m=re.search(r'(?<!\w)(?:za\s*)?(\d+(?:[,.]\d+)?)\s*(kg|g|l|ml|szt\.?)(?!\w)',value,re.I)
+                if m:return m.group(0)
+        # e.g. {quantity:1, unit: 'kg'} used only if BOTH are present and
+        # quantity is small and unit explicit.
+        amount=d.get('priceQuantity',d.get('pricingQuantity'))
+        unit=d.get('priceUnit',d.get('pricingUnit'))
+        if isinstance(amount,(int,float)) and isinstance(unit,str):
+            if 0<amount<=10000 and unit.lower().strip() in ('kg','g','l','ml','szt','szt.'):
+                return str(amount)+' '+unit
+    return ''
+
+
 def window_offer_candidates(html,leaflet):
     rows=embedded_offers(html)
     candidates=[]
     for row in rows:
         name=embedded_name(row)
         if not name:continue
-        price=None
-        for key in ('promotionalPrice','promoPrice','currentPrice','price','grossPrice'):
-            if key in row:
-                price=embedded_price(row[key]);break
-        if price is None:
-            for key in ('price','promotionalPrice'):
-                nested=row.get('product')
-                if isinstance(nested,dict) and key in nested:
-                    price=embedded_price(nested[key]);break
+        pricevalue,pricefield=_lookup(row,PRICE_KEYS)
+        price=embedded_price(pricevalue)
         if price is None:continue
-        size=embedded_size(row) or price_unit_size(row)
-        label=(name+' '+size).strip() if size and size.lower() not in name.lower() else name
+        size=_read_size(row)
+        label=(name+' '+size).strip() if size and size.casefold() not in name.casefold() else name
         detail=''
-        for key in ('promotionText','promoText','conditions','promoLabel'):
-            value=row.get(key)
-            if isinstance(value,str):detail+=' '+value[:200]
+        for d in _contexts(row):
+            for key in ('promotionText','promoText','conditions','promoLabel','discountLabel'):
+                value=d.get(key)
+                if isinstance(value,str):detail+=' '+value[:200]
         line=f'{label} za {str(format(price,".2f")).replace(".",",")} zł{detail}'
         url=row.get('url') or row.get('link') or leaflet['url']
         if not isinstance(url,str) or not url.startswith('https://blix.pl/'):
             url=leaflet['url']
-        regular=None
-        for key in ('regularPrice','originalPrice','oldPrice','previousPrice'):
-            if key in row:
-                regular=embedded_price(row[key])
-                break
-        extras={'regularPrice':regular if regular is not None and regular>price else None}
+        regular_value,regular_key=_lookup(row,REGULAR_KEYS)
+        regular=embedded_price(regular_value)
+        if regular is not None and regular<=price:regular=None
+        percentage,pct_key=_read_discount(row)
+        if pct_key=='discount' and isinstance(_lookup(row,DISCOUNT_KEYS)[0],(int,float)) and regular is None:
+            # Generic 'discount' may be an amount in grosze, not a percent.
+            percentage=None
+        if regular is not None and percentage is not None:
+            calculated=100*(regular-price)/regular
+            if abs(calculated-percentage)>2.0:
+                # The old price is explicit; a mismatched percent may refer
+                # to a different promotion. Do not publish that percent.
+                percentage=None
+        pg=row.get('pageNumber',row.get('page',row.get('pageIndex')))
+        page_number=None
+        if isinstance(pg,int) and 0<=pg<=300:page_number=pg or 1
+        extras={'regularPrice':regular,'discountPct':percentage,'unitEvidence':size,
+                'regularEvidence':regular_key if regular else None,
+                'percentageEvidence':pct_key if percentage else None,
+                'priceEvidence':pricefield,'pageNumber':page_number}
         candidates.append((label,line,url,'window.offers',extras))
     return candidates,len(rows)
 
@@ -385,7 +479,7 @@ def extract_candidates(html, leaflet, today, diagnostics=None):
         size=parse_size(name,ing)
         note='Źródło: Blix, '+method
         if PROMO_COMPLEX.search(txt+' '+name):note+='; sprawdź warunki promocji'
-        base={'ingredient':ing,'store':leaflet['store'],'product':name[:220],'price':round(price,2),'regularPrice':extras.get('regularPrice'),'from':leaflet['from'],'to':leaflet['to'],'url':url if url.startswith('https://blix.pl/') else leaflet['url'],'note':note,'minQty':1,'source':'Blix','sourceMethod':method}
+        base={'ingredient':ing,'store':leaflet['store'],'product':name[:220],'price':round(price,2),'regularPrice':extras.get('regularPrice'),'discountPct':extras.get('discountPct'),'unitEvidence':extras.get('unitEvidence'),'regularEvidence':extras.get('regularEvidence'),'pageNumber':extras.get('pageNumber'),'from':leaflet['from'],'to':leaflet['to'],'url':url if url.startswith('https://blix.pl/') else leaflet['url'],'note':note,'minQty':1,'source':'Blix','sourceMethod':method}
         key=(ing,base['store'],base['price'],name)
         if key in unique:continue
         unique.add(key)
@@ -399,6 +493,8 @@ def extract_candidates(html, leaflet, today, diagnostics=None):
     if diagnostics is not None:
         diagnostics['accepted']+=len(accepted)
         diagnostics['review']+=len(review)
+        diagnostics['withReferencePrice']=diagnostics.get('withReferencePrice',0)+sum(x.get('regularPrice') is not None for x in accepted+review)
+        diagnostics['withDiscountPercent']=diagnostics.get('withDiscountPercent',0)+sum(x.get('discountPct') is not None for x in accepted+review)
     return accepted,review
 
 
@@ -434,7 +530,7 @@ class Fetcher:
 
 def run(output_path,now=None,fetcher=None,max_per_store=2):
     now=now or dt.date.today();fetcher=fetcher or Fetcher()
-    result={'source':'https://blix.pl/rss/gazetki','generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'validFor':now.isoformat(),'status':'ok','leaflets':[],'offers':[],'review':[],'errors':[],'warnings':[],'diagnostics':{'pagesFetched':0,'embeddedObjects':0,'catalogCandidates':0,'explicitPriceUnits':0,'explicitPackSizes':0,'sampleProductKeys':[],'accepted':0,'review':0},'notice':'Automatyczny odczyt strony źródłowej, nie potwierdzenie ceny w sklepie. Braki danych wymagają sprawdzenia.'}
+    result={'source':'https://blix.pl/rss/gazetki','generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'validFor':now.isoformat(),'status':'ok','leaflets':[],'offers':[],'review':[],'errors':[],'warnings':[],'diagnostics':{'pagesFetched':0,'embeddedObjects':0,'catalogCandidates':0,'explicitPriceUnits':0,'explicitPackSizes':0,'sampleProductKeys':[],'accepted':0,'review':0,'withReferencePrice':0,'withDiscountPercent':0},'notice':'Automatyczny odczyt strony źródłowej, nie potwierdzenie ceny w sklepie. Braki danych wymagają sprawdzenia.'}
     try: rss=fetcher.get(RSS_URL)
     except Exception as e:
         result['status']='source_unavailable';result['errors'].append(str(e));return write(output_path,result)
@@ -457,6 +553,19 @@ def run(output_path,now=None,fetcher=None,max_per_store=2):
     if result['leaflets'] and not result['offers'] and not result['review']:
         result['warnings'].append('Wykryto gazetki, ale nie udało się odczytać ani jednej ceny składnika. Sprawdź diagnostics oraz strukturę stron Blixa.')
         if result['status']=='ok':result['status']='partial'
+    # Optional image-based validation. The vision module never bypasses robots.txt
+    # and only emits offers tied to an independently observed price in window.offers.
+    if os.getenv('GEMINI_API_KEY') and result['review']:
+        try:
+            from vision_verify import enrich_review
+            enrich_review(result,fetcher=fetcher,max_screens=int(os.getenv('BLIX_VISION_MAX_SCREENS','6')))
+        except Exception as ex:
+            result['warnings'].append('Weryfikacja obrazów nie powiodła się: '+str(ex)[:160])
+            if result['status']=='ok':result['status']='partial'
+    elif result['review']:
+        result['warnings'].append('Brakuje GEMINI_API_KEY: nie można automatycznie odczytać brakujących informacji z grafiki gazetek.')
+    if result['leaflets'] and not result['offers']:
+        result['warnings'].append('Nie ma żadnych ofert z potwierdzoną jednostką. Nie wyświetlam zmyślonych oszczędności.')
     # prevent excessive stored candidate data
     result['offers']=result['offers'][:350];result['review']=result['review'][:500]
     return write(output_path,result)
