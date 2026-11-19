@@ -1,0 +1,11 @@
+{
+  "source": "https://blix.pl/rss/gazetki",
+  "generatedAt": null,
+  "validFor": null,
+  "status": "not_run",
+  "leaflets": [],
+  "offers": [],
+  "review": [],
+  "errors": [],
+  "notice": "To tylko plik początkowy. Aktualne dane pojawią się po pierwszym poprawnym uruchomieniu harmonogramu w repozytorium GitHub."
+}
