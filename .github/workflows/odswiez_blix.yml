@@ -1,20 +1,16 @@
-
 name: Odswiez gazetki Blix i opublikuj Szama na Promce
-
 on:
   workflow_dispatch:
   schedule:
+    # 06:25 UTC = 07:25 CET / 08:25 CEST. GitHub może uruchomić później.
     - cron: '25 6 * * *'
-
 permissions:
   contents: read
   pages: write
   id-token: write
-
 concurrency:
   group: pages
   cancel-in-progress: false
-
 jobs:
   build_and_deploy:
     runs-on: ubuntu-latest
@@ -30,16 +26,41 @@ jobs:
       - name: Zainstaluj zaleznosci
         run: pip install -r requirements.txt
       - name: Testy importu
-        run: python -m unittest discover -s tests -p test_blix_import.py -v
-      - name: Pobierz oferty z Blix
+        run: python -m unittest discover -s tests -p 'test*.py' -v
+      - name: Przygotuj odczyt obrazów gazetki (jeśli jest klucz Gemini)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          python scripts/blix_import.py --output site/data/blix_promocje.json --max-per-store 2 || echo 'Nie udalo sie pobrac ofert.'
+          if [ -n "$GEMINI_API_KEY" ]; then
+            pip install 'playwright>=1.49,<2'
+            python -m playwright install --with-deps chromium
+          else
+            echo 'Brak GEMINI_API_KEY: użyte zostaną tylko jednoznaczne tekstowe dane Blixa.'
+          fi
+      - name: Pobierz oferty z Blix (robots.txt, limity i walidacja)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          BLIX_VISION_MAX_SCREENS: '6'
+        run: |
+          python scripts/blix_import.py --output site/data/blix_promocje.json --max-per-store 2
+          python - <<'PYCODE'
+          import json,os
+          d=json.load(open('site/data/blix_promocje.json',encoding='utf-8'))
+          lines=['### Blix import – wynik',
+                 '- Status: '+d.get('status','brak'),
+                 '- Gazetki: '+str(len(d.get('leaflets',[]))),
+                 '- Zatwierdzone oferty: '+str(len(d.get('offers',[]))),
+                 '- Do sprawdzenia: '+str(len(d.get('review',[]))),
+                 '- Weryfikacja obrazów: '+str(d.get('diagnostics',{}).get('visualOffersAccepted','wyłączona'))]
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write('\n'.join(lines)+'\n')
+          if not d.get('offers'):print('::warning::Brak ofert z potwierdzoną jednostką! Strona będzie działać, ale ranking będzie niepełny.')
+          PYCODE
       - name: Konfiguruj GitHub Pages
         uses: actions/configure-pages@v5
-      - name: Spakuj strone
+      - name: Spakuj stronę do publikacji
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
-      - name: Opublikuj strone
+      - name: Opublikuj stronę
         id: deploy
         uses: actions/deploy-pages@v4
